@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>celld Teach｜无共识的分布式状态层</title>
+<meta name="description" content="denoland/celld 深潜课程：条件写所有权、epoch fencing、RPO=0——什么情况下你可以不要 Paxos/Raft。数据库架构 × 产品开发 × Agent 工程。">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<nav class="site-nav">
+  <a class="brand" href="index.html">celld Teach</a>
+  <a href="reference/cheatsheet.html">速查表</a>
+  <span class="sep"></span>
+  <a href="https://github.com/denoland/celld" target="_blank" rel="noopener">GitHub ↗</a>
+  <a href="https://celld.dev" target="_blank" rel="noopener">celld.dev ↗</a>
+</nav>
+
+<header class="hero">
+  <div class="eyebrow">denoland/celld · Rust · self-hosted Durable Objects</div>
+  <h1>celld：无共识的分布式状态层</h1>
+  <p class="lede">Deno 官方 2025-04 开源的 Rust 守护进程：在自有机器上跑 Cloudflare Workers + Durable Objects，用对象存储当控制平面，<strong>不引入 Paxos / Raft</strong>。本课程围绕三条机制支柱展开——条件写所有权、epoch fencing、RPO=0 确认规则。</p>
+  <div class="tags">
+    <span class="tag">分布式系统</span><span class="tag">数据库架构</span><span class="tag">SQLite / LTX</span><span class="tag">Rust</span><span class="tag">Agent 工程</span>
+  </div>
+</header>
+
+<section class="mission-card">
+  <div class="label">MISSION · 学完你能做什么</div>
+  <ul style="margin:0; padding-left:1.2rem; color:rgb(255 255 255 / 88%);">
+    <li>讲清 celld 的三条核心机制：conditional-write 所有权、epoch fencing、RPO=0 确认规则</li>
+    <li>解释 fleet proof vs bucket proof 两种持久化路径，以及为什么 2 节点是分水岭</li>
+    <li>对比 celld 与传统分布式数据库（Paxos/Raft 多副本）的设计取舍——为什么 celld 敢不要共识</li>
+    <li>梳理 LTX 血统（Litestream → rustyriver → celld-ltx）及它在复制链中的角色</li>
+    <li>（元层）把「对象存储条件写 = 免费的领导权仲裁」迁移到自己的系统设计</li>
+  </ul>
+</section>
+
+<section class="chapter" id="curriculum">
+  <h2>课程</h2>
+  <ul class="lesson-list">
+    <li class="lesson-item">
+      <span class="num">L1</span>
+      <div style="flex:1">
+        <a class="title" href="lessons/0001-celld-no-consensus-state-layer.html">celld：无共识的分布式状态层</a>
+        <div class="desc">概念地图（cell/node/fleet/bucket）→ 支柱① 条件写所有权 → 支柱② epoch 前缀 fencing → 支柱③ RPO=0 双重证明 → 与单写者复制家族对比 → 对数据库产品人的迁移启示。含随堂测验。</div>
+      </div>
+    </li>
+    <li class="lesson-item">
+      <span class="num">L2</span>
+      <div style="flex:1">
+        <span class="title soon">待定：跑起来看 cell 状态机 / 源码深潜 node_log.rs / 复制家族横向对比 / 真实 bucket kill-test</span>
+        <div class="desc">学习记录 001 末尾留了四个方向（A/B/C/D），等 kejun 选择后开课。</div>
+      </div>
+    </li>
+  </ul>
+</section>
+
+<section class="chapter" id="resources">
+  <h2>资源</h2>
+  <div class="resource-grid">
+    <a class="resource-card" href="reference/cheatsheet.html">
+      <span class="rc-title">速查表</span>
+      <span class="rc-sub">一页可打印：词汇表、三条支柱、bucket 三性质、写路径对比、生命周期。</span>
+      <span class="mono">reference/cheatsheet.html</span>
+    </a>
+    <a class="resource-card" href="MISSION.md">
+      <span class="rc-title">MISSION</span>
+      <span class="rc-sub">为什么学 celld：推断动机、五条成功标准、Alpha 约束。</span>
+      <span class="mono">MISSION.md</span>
+    </a>
+    <a class="resource-card" href="RESOURCES.md">
+      <span class="rc-title">资源地图</span>
+      <span class="rc-sub">官方文档优先级、crates/ 源码锚点、周边/迁移参照、一次运行验证。</span>
+      <span class="mono">RESOURCES.md</span>
+    </a>
+    <a class="resource-card" href="learning-records/001-first-lesson.md">
+      <span class="rc-title">学习记录 001</span>
+      <span class="rc-sub">第 1 课交付物、核心收获、待确认的下一步方向。</span>
+      <span class="mono">learning-records/001-first-lesson.md</span>
+    </a>
+  </div>
+</section>
+
+<footer class="footer">
+  celld Teach · 素材以官方文档 + 源码为准（Alpha 项目）· kejun 的学习工作区部署
+</footer>
+
+</body>
+</html>
