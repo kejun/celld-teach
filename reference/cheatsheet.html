@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>速查表｜celld 无共识分布式状态层</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<nav class="site-nav">
+  <a class="brand" href="../index.html">celld Teach</a>
+  <a href="../index.html#curriculum">课程</a>
+  <a href="../index.html#resources">资源</a>
+  <span class="sep"></span>
+  <a href="https://github.com/denoland/celld" target="_blank" rel="noopener">GitHub ↗</a>
+  <a href="https://celld.dev" target="_blank" rel="noopener">celld.dev ↗</a>
+</nav>
+
+<h1>celld 速查表</h1>
+<div class="subtitle">denoland/celld · Self-hosted, distributed Durable Objects · 一页可打印</div>
+
+<h2>0. 一句话</h2>
+<div class="note">celld = 把 Cloudflare Durable Objects 搬到自己机器上的 Rust 守护进程。每个「cell」= 一个命名服务器 + 一个私有 SQLite 库。所有权用<strong>对象存储条件写</strong>仲裁，不用共识协议。</div>
+
+<h2>1. 词汇表</h2>
+<table>
+<tr><th>词</th><th>含义</th></tr>
+<tr><td>cell</td><td>一个 Durable Object：命名 + 私有 SQLite 库，单线程一致性，可休眠</td></tr>
+<tr><td>node</td><td>一个 celld 进程（一台机器），内嵌 V8，跑 Wrangler bundle</td></tr>
+<tr><td>fleet</td><td>共享同一 bucket 的所有节点；一 fleet 跑一个 application</td></tr>
+<tr><td>bucket</td><td>你拥有的对象存储（S3/R2/GCS/Azure），存部署 + cell 状态 + 所有权记录</td></tr>
+<tr><td>LTX</td><td>SQLite 复制事务格式（Litestream → rustyriver → celld-ltx）</td></tr>
+<tr><td>epoch</td><td>每次激活递增的 fencing 代数；复制写入 <code>e&lt;epoch&gt;/</code> 前缀下</td></tr>
+<tr><td>ensemble</td><td>cell 主人的 1-2 个 follower 节点；fleet proof 的仲裁集合</td></tr>
+<tr><td>RPO=0</td><td>承认的写必然已跨故障存活（recovery point zero）</td></tr>
+<tr><td>self-fence</td><td>节点失去 lease 后自我终止（exit 3），不写 bucket，直接退出</td></tr>
+</table>
+
+<h2>2. 三条设计支柱</h2>
+<table>
+<tr><th>支柱</th><th>机制</th><th>解决的问题</th></tr>
+<tr><td>① 所有权 = 条件写</td><td>create/CAS 一个 ownership record；bucket 只接受一个赢家</td><td>「谁拥有 cell」——不需要成员协议/故障检测/共识</td></tr>
+<tr><td>② 数据 fencing = epoch 前缀</td><td>复制写入 <code>cells/&lt;cell&gt;/ltx/e&lt;epoch&gt;/</code>，restore 选当前 lineage</td><td>陈旧的写不能污染新主人的状态</td></tr>
+<tr><td>③ RPO=0 = 双重证明</td><td>bucket proof（单节点）或 fleet proof（2+ 节点，follower fsync）</td><td>「写成功」必须真的跨故障存活</td></tr>
+</table>
+
+<h2>3. bucket 必须提供的三性质 + storage test</h2>
+<ol>
+<li>条件 create（对象存在则失败）</li>
+<li>条件 overwrite（对象被改后 CAS 失败）</li>
+<li>读后写一致性（写完立即可读回）</li>
+</ol>
+<div class="note"><strong>已认证</strong>：S3 / R2 / Tigris / GCS / Azure Blob（Release tests 跑 R2）。<br>
+<strong>不可用</strong>：Backblaze B2、Hetzner Object Storage、DO Spaces（无条件写）→ celld 在此类存储上不正确（两节点可同时拥有一个 cell）。<br>
+<strong>MinIO community</strong>：条件写可用、能过 storage test，但未认证生产（一个已知坏版本 2025-09-06，用 09-07 之后）。</div>
+<p><code>celld diagnose</code> 发 4 个条件写验证（2 个应失败）：「ok bucket conditional write (create, reject-create, update, reject-stale)」，失败即退出。</p>
+
+<h2>4. 写路径（两种持久化证明）</h2>
+<table>
+<tr><th></th><th>单节点（bucket proof）</th><th>2+ 节点（fleet proof，默认）</th></tr>
+<tr><td>顺序</td><td>写 WAL → 上传 bucket → 读 ownership 确认</td><td>写 WAL → 发给 1-2 follower → follower fsync → 应答 → 之后补传 bucket</td></tr>
+<tr><td>延迟</td><td>~90ms（region-local）/ ~600ms（跨区域）</td><td>~25ms（有第二节点后）</td></tr>
+<tr><td>确认规则</td><td>上传后读 ownership record，仍是我这个 node@epoch 才确认</td><td>follower fsync 即认为持久；takeover 会封旧 node-log session</td></tr>
+</table>
+
+<h2>5. 生命周期与压力控制</h2>
+<ul>
+<li><strong>cell 状态</strong>：resident(active/idle) → hibernated（保留 WebSocket）→ inactive（仅 bucket 里的对象，近零成本）</li>
+<li><strong>冷激活</strong>：check 前主人 node-log records（absent=从未确认过 / sealed=恢复完成 / open→先 recovery 再 restore）</li>
+<li><strong>节点 lease</strong>：bucket 里一条记录，1/3 生命周期续期（TTL 默认 10s）；续不上→ self-fence → exit 3 → supervisor 重启</li>
+<li><strong>超载</strong>：单 cell 最多 64 并发 fetch（CELLD_MAX_CELL_REQUESTS），超载 503 + Retry-After: 1</li>
+<li><strong>内存</strong>：CELLD_MAX_RSS_MB（默认 80% 阈值，95% 绝对上限）、CELLD_V8_HEAP_LIMIT_MB（默认 128MB ≈ 5 万 WebSocket 客户端）</li>
+</ul>
+
+<h2>6. 常用命令</h2>
+<pre><code>celld dev                          # 本地开发，worker 在 :9876，状态在 .celld/dev
+celld deploy . --bucket s3://...   # 部署（需要 esbuild on PATH）
+celld --bucket s3://... --listen :8080 --internal-listen :8081 --advertise ...   # 起节点
+celld diagnose --bucket ...        # 诊断 + storage test + peer probe
+celld cell list --bucket ...       # 列出 DO 实例（Class:ID，1000/请求）
+celld d1 migrations apply ledger   # D1 迁移
+celld kv bulk put sessions export.json   # KV 导入（wrangler 格式）
+celld queue pause/resume jobs      # 队列控制</code></pre>
+
+<h2>7. 关键环境变量</h2>
+<table>
+<tr><th>变量</th><th>作用</th></tr>
+<tr><td>CELLD_DURABILITY (fleet|bucket)</td><td>持久化证明方式；默认 fleet</td></tr>
+<tr><td>CELLD_OUTPUT_GATE (0|1)</td><td>关闭复制等待 = 接受已确认写丢失；默认 1</td></tr>
+<tr><td>CELLD_TTL_MS</td><td>节点 lease 生命周期，默认 10000</td></tr>
+<tr><td>CELLD_LTX_COMPACTION (0|1)</td><td>L1 压缩对象；混合舰队旧 reader 需 0</td></tr>
+<tr><td>CELLD_MAX_RESIDENT_CELLS</td><td>每节点常驻 cell 硬上限</td></tr>
+<tr><td>CELLD_MAX_RSS_MB / CELLD_V8_HEAP_LIMIT_MB</td><td>内存压测阈值 / isolate 堆上限</td></tr>
+<tr><td>CELLD_ACTIVATIONS</td><td>并发冷激活上限（默认 CPU 数或 128）</td></tr>
+<tr><td>CELLD_ADDR / CELLD_INTERNAL_ADDR / CELLD_ADVERTISE</td><td>三个监听/通告地址（公网/内网分开）</td></tr>
+<tr><td>CELLD_DEPLOY_POLL_S / CELLD_DEPLOY_MAX_AGE_S</td><td>部署轮询 30s / 代码强制下线 60s</td></tr>
+</table>
+
+<h2>8. 限制（alpha 诚实面）</h2>
+<ul>
+<li>一 fleet 只有一个 application；无多租户/账务/托管 ingress</li>
+<li>节点加入不 rebalance —— 流量分配 unowned/released cell</li>
+<li>不终结 TLS；peer HTTP 明文→ 必须私有网络 / WireGuard / Tailscale</li>
+<li>peer 通道靠 fleet HMAC（绑定 body + 时钟限制 + 重放保护）</li>
+<li>Windows 不支持；仅 Linux x86-64 / ARM64 / Apple Silicon</li>
+<li>celld 对 B2/Hetzner/DO Spaces 直接不正确（不能 fence）</li>
+</ul>
+
+<h2>9. 真相来源</h2>
+<ul>
+<li>guarantees.md — 协议论证全文（bucket 性质、mechanism、takeover gate）</li>
+<li>README/docs-README — 操作与部署契约</li>
+<li>crates/ltx/README.md — LTX 尘缘（Litestream v0.5.11/0.5.16 + superfly/ltx v0.5.2 + rustyriver）</li>
+<li>protocol.rs — bucket 持久类型（Manifest/deploy 契约）</li>
+</ul>
+
+</body>
+</html>
