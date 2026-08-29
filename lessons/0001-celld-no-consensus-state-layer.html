@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 1 课｜celld：无共识的分布式状态层</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<nav class="site-nav">
+  <a class="brand" href="../index.html">celld Teach</a>
+  <a href="../index.html#curriculum">课程</a>
+  <a href="../reference/cheatsheet.html">速查表</a>
+  <span class="sep"></span>
+  <a href="https://github.com/denoland/celld" target="_blank" rel="noopener">GitHub ↗</a>
+  <a href="https://celld.dev" target="_blank" rel="noopener">celld.dev ↗</a>
+</nav>
+
+<h1>第 1 课｜celld：无共识的分布式状态层</h1>
+<div class="subtitle">denoland/celld · 把 Cloudflare Durable Objects 搬回家 · Lesson 1 of N</div>
+<div class="lesson-meta">
+  <span class="tag">分布式系统</span><span class="tag">数据库架构</span><span class="tag">Rust</span><span class="tag">~40 min</span><br>
+  主教材：<a href="https://github.com/denoland/celld/blob/main/README.md" target="_blank" rel="noopener">README.md</a> · <a href="https://github.com/denoland/celld/blob/main/docs/guarantees.md" target="_blank" rel="noopener">docs/guarantees.md</a> · 配套：<a href="../reference/cheatsheet.html">速查表</a>
+</div>
+
+<h2>0. 开场：我们解剖的是一台什么机器</h2>
+<p><strong>celld</strong> 是 Deno 官方（denoland）2025-04 开源的一个 Rust 守护进程，一次把两个问题叠在一起回答：</p>
+<ul>
+  <li><strong>能不能在自有机器上跑 Cloudflare Workers + Durable Objects？</strong> —— 每个 node 内嵌 V8，执行 Wrangler bundle，API 兼容 Workers。</li>
+  <li><strong>能不能不做共识，就做出「分布式 + 持久化」？</strong> —— 节点之间没有 membership protocol、没有 failure detector、没有 consensus service。</li>
+</ul>
+<p>它用对象存储（S3/R2/GCS/Azure Blob）当整个系统的「控制平面 + 长期记忆」。每个业务对象是一个 <strong>cell</strong>：一个命名服务器 + 一个私有 SQLite 数据库。cell 空闲时在 bucket 里只是一个对象，成本几乎为零——官方数字：8GB 节点装 1000 个常驻 cell，每个 cell 约 $0.05/月。</p>
+<div class="note"><strong>这堂课的双重读法</strong>：表面读法是理解 celld 的「条件写所有权 → epoch fencing → RPO=0」协议链；深层读法是理解一个反直觉的分布式设计命题——<strong>什么情况下你可以不要 Paxos/Raft？</strong>这对你评估自家 Database/Agent 平台的架构取舍有直接迁移价值。</div>
+
+<h2>1. 概念地图：cell / node / fleet / bucket</h2>
+<table>
+<tr><th>概念</th><th>是什么</th><th>类比</th></tr>
+<tr><td><strong>cell</strong></td><td>一个 Durable Object：命名 + 私有 SQLite 库，单线程一致</td><td>一个「用户 / 文档 / 聊天室 / AI agent」</td></tr>
+<tr><td><strong>node</strong></td><td>一个 celld 进程（一台机器），内嵌 V8，跑 Worker</td><td>一个可替换的计算单元</td></tr>
+<tr><td><strong>fleet</strong></td><td>共享同一 bucket 的所有节点；一 fleet 跑一个应用</td><td>一个「部署集群」</td></tr>
+<tr><td><strong>bucket</strong></td><td>你拥有的对象存储：部署产物 + cell 状态 + 所有权/租约记录</td><td>系统的「真相磁盘」+ 「选举裁判」</td></tr>
+</table>
+<p>关键设计决定：<strong>没有任何「服务发现/控制面」服务</strong>。节点之间怎么互相找到？通过 bucket 里的 leases。节点如何知道一个 cell 归谁？bucket 里的 ownership record。初看起来违背直觉——对象存储的读写延迟不是很高吗？——但注意：<strong>路由请求是热点路径，但所有权记录是低频路径</strong>（每次激活/迁移才写一次）。把「热数据」与「仲裁元数据」分开，是这套设计的第一个杠杆。</p>
+
+<h2>2. 支柱① 所有权 = 条件写（conditional write）</h2>
+<p>一个 cell 同一时刻只能被一个节点拥有，否则两台机器写同一个 SQLite 库 → 数据损坏。<br>
+传统解法：Raft/Paxos 选一个 leader。celld 的解法：<strong>让对象存储当裁判</strong>——它对 bucket 提三个要求：</p>
+<ol>
+  <li><strong>条件 create</strong>：对象已存在时写入必须失败</li>
+  <li><strong>条件 overwrite</strong>：对象在我读后被改过，写入必须失败（CAS）</li>
+  <li><strong>读后写一致性</strong>：写成功后读回的一定是那份</li>
+</ol>
+<p>获取 cell：无记录 → create；有记录 → compare-and-swap。bucket 只接受一个赢家，于是<strong>两个节点不可能同时 acquire 同一个 cell</strong>——仲裁被交给一个已经为「原子性」付过钱的外部服务。代价：存储必须真的实现这些条件（所以 B2/Hetzner/DO Spaces 被排除，celld 在这些存储上「不正确」），并且启动时要跑 storage test 验证。</p>
+<blockquote>“A node claims a cell by writing a small record to the bucket… Object storage therefore decides who wins.”</blockquote>
+<p>这里有个对产品人的启示：<strong>把「权威」委托给云存储的条件写，等于把「成员管理」整个功能外包</strong>——你不再需要实现心跳超时、phantom leader 检测、leader 选举日志。系统更小，故障面更小。</p>
+
+<h2>3. 支柱② 数据 fencing = epoch 前缀</h2>
+<p>有了「谁拥有」还不够，还要防「曾经拥有者继续写」。celld 引入 <strong>fencing epoch</strong>：每次激活（包括 takeover 和本地 wake）都把 epoch +1。复制到 bucket 的数据写在 <code>cells/&lt;cell&gt;/ltx/e&lt;epoch&gt;/</code> 前缀下——<strong>epoch 在对象 key 里</strong>。</p>
+<ul>
+  <li>失去所有权的节点可以继续写，但只能写进已被取代的前缀</li>
+  <li>restore 时选择最新的、含 LTX 数据的 epoch 前缀</li>
+  <li>每个 epoch 只有一个 writer —— fence 通过「写哪」来保证，而不是「禁止写」</li>
+</ul>
+<p>这是经典 fencing token 思想（Martin Kleppmann 写过）的存储化实现：<strong>不阻止旧主写，只保证旧主的写永远不可见</strong>。用前缀隔离而不是锁，好处是失败节点不需要任何「同步配合」——它被切成什么样都行，迟到的写自然落到过期前缀。</p>
+
+<h2>4. 支柱③ RPO=0：承认的写必须真的活着</h2>
+<p>celld 对用户承诺：<strong>告诉你说成功的写，绝不会丢</strong>（recovery point zero）。怎么证明一次写跨故障存活？两条路径：</p>
+<h3>4.1 单节点（bucket proof）</h3>
+<ol>
+  <li>capture committed SQLite write 为 LTX 数据</li>
+  <li>上传到 bucket —— 一个存储往返</li>
+  <li><strong>读一次 ownership record</strong>：如果我仍然是这个 node @ 这个 epoch，才确认</li>
+</ol>
+<p>那个「读 ownership」是关键：分区节点可能本地 commit + 复制进过期前缀，但 ownership 读会显示新主人，于是它<strong>不会确认</strong>。它用「读权威记录」而不是「比时钟」，所以暂停的进程、乱了的时钟都骗不过它。</p>
+<h3>4.2 两节点以上（fleet proof，默认）</h3>
+<ol>
+  <li>owner 把每次写发给 1-2 个 follower（ensemble）</li>
+  <li>follower 必须 fsync 才应答</li>
+  <li>应答 = 写已跨故障存活（两个磁盘）—— 比 bucket 往返快一个量级</li>
+  <li>之后再把数据补传 bucket（长期记忆），bucket 上传可稍后完成</li>
+</ol>
+<p>数据表：region-local bucket 一轮写约 <strong>90 ms</strong>；实验室跨区域约 <strong>600 ms</strong>；有第二个节点后约 <strong>25 ms</strong>。</p>
+<div class="note"><strong>为什么 2 节点是分水岭</strong>：node 从「其他节点」里挑 follower，不会把自己算进去 → 至少 2 个节点才能完成 fleet proof。默认 <code>CELLD_DURABILITY=fleet</code>，所以单节点集群也会请求 fleet 姿势——得不到就退回 bucket proof，正确但慢，README 直接说「write latency matters → 跑 ≥2 nodes」。</div>
+<p>fleet proof 的安全性还依赖一个细节：<strong>takeover 会封（seal）前一个 node-log session</strong>——新主人恢复前先把旧 session 封死，于是旧 owner 不能再完成新的 fleet proof。这解释了为什么「条件 node-log record + 冷激活 recovery gate」存在。</p>
+
+<h2>5. 冷激活恢复门（takeover recovery gate）</h2>
+<p>冷激活读 bucket 前，先检查前主人的 log records：</p>
+<table>
+<tr><th>前主人记录状态</th><th>含义</th><th>动作</th></tr>
+<tr><td>absent</td><td>该 session 从未确认过任何「fleet 持久」写</td><td>直接 restore</td></tr>
+<tr><td>sealed</td><td>恢复已完成</td><td>直接 restore</td></tr>
+<tr><td>open / recovering</td><td>可能丢了已确认但未上传的尾部</td><td>跑 recovery：CAS 封记录 → 封可达 follower → 上传它们保留的 segments/bundles → 标记 sealed，<strong>然后才能 restore</strong></td></tr>
+</table>
+<p>一句话：<strong>不能跳过恢复就开始读，否则已确认的数据可能还躺在别的节点磁盘上</strong>。restore 本身读「从事务 0 开始的完整连续链」（读取最新 epoch 前缀里带的全部 LTX），所以被 fence 的非确认尾部可能会被读出来——这不违反契约：<em>「没确认」不等于「必须没有」</em>，多读出来的是未确认写，会暴露但不是丢失。</p>
+
+<h2>6. 自围栏（self-fencing）与运维契约</h2>
+<p>每个节点持一条 bucket lease（默认 TTL 10s，过了 1/3 就续期）。</p>
+<ul>
+  <li>续不上 → 等到已发布过期时间过了 → <strong>self-fence</strong>：停所有 active cell、fail 所有未完成请求、exit code 3</li>
+  <li>lease 被别的 writer 替换/删除 → 立即 fence（权威已经移走）</li>
+  <li>fence 不写 bucket —— 每个 peer 已经看到 lease 死/被替换，他们通过 ownership records 拿 cell</li>
+  <li>请求路由时每次都对比「当前时间 vs 已发布过期时间」—— fence 跑之前请求也已经安全</li>
+</ul>
+<div class="warn"><strong>运维契约（部署者必须知道）</strong>：celld 必须跑在 supervisor（systemd/Docker restart policy/K8s）下；fenced 进程立即退出，没有 supervisor 重启 = fleet 容量缺失。supervisor 重启间隔 ≥ 一个 lease 生命周期，且不设尝试上限。fence 是终结态，重启走冷激活路径——「节点失败」是一等输入，不是恢复流程。</div>
+
+<h2>7. LTX：SQLite 复制的血脉</h2>
+<p>复制的载体不是 binlog 而是 <strong>LTX</strong>——SQLite 的 WAL 事务格式。celld-ltx crate 是 2026-08-03 从 <strong>rustyriver</strong>（Litestream v0.5 的 Rust 重实现）快照过来的，直接承接 <strong>Litestream</strong>（Ben Johnson）+ <strong>superfly/ltx</strong> 的格式血统：</p>
+<ul>
+  <li>普通 L0 writer 发旧 frame 表示；v0.5.2 encoder/compactor 发新 block 表示；两者文件版本都是 3</li>
+  <li>默认开启节点级 L1 compaction（additive 对象），takeover 读「几十个对象」而不是「几千个」</li>
+  <li>混合舰队需 <code>CELLD_LTX_COMPACTION=0</code> 直到所有节点能读 block 文件（reader-first 升级）</li>
+  <li>有意思的取舍：Litestream 的 leaser（对象存储租约）被 port 后 <strong>删除了</strong>——celld 用 conditional-write record + epoch 前缀 fencing，再加一层 lease file 反而打架</li>
+</ul>
+<p>专业点：<strong>SQLite 的 WAL 天然是 append-only 日志</strong>——这就是「捕获天然复制源」的好处：不用解析 SQL、不用改 SQLite 内核，读 WAL 即成 LTX。</p>
+
+<h2>8. 与主流分布式数据库的三个对比</h2>
+<h3>8.1 vs OceanBase（Paxos 多副本）</h3>
+<p>OB 用 Paxos 组内同步多副本，靠 <code>clog</code> 复制，多数派确认；celld 是<strong>单写者 + 外部仲裁</strong>——写入只在一个 node 发生，仲裁交给对象存储的原子条件写。OB 追求「任何副本可读、故障毫秒级自动切换」的通用性；celld 用「一 cell 一主、切换要经过 bucket 恢复」换来了<strong>没有成员协议、没有选主协议</strong>的系统简化。适用性分界：<strong>你的数据能不能按「命名实体」天然分片？</strong>能 → celld 模式划算；不能（跨片事务密集、需要强一致多副本直读）→ Paxos/Raft 不可省。</p>
+<h3>8.2 vs MongoDB Atlas（分片 + 副本集）</h3>
+<p>Mongo 的 shard = 副本集 + config server + mongos 路由；celld 的 cell 分片 = bucket 里的对象 + 节点按流量领取。Mongo 是「数据库提供分片」；celld 是「运行时提供分片」（cell 即分片，应用从第一天就按实体划分）。共同点：都意识到「共享同一数据库的争用」可以通过分区消除。</p>
+<h3>8.3 vs Litestream（单机复制工具）</h3>
+<p>Litestream 是把单个 SQLite 库持续复制到对象存储（恢复点在秒级）；celld 把它升维成「每个 cell 自己的 SQLite + 复制 + 所有权」，并加上了<strong>多节点快速确认（fleet proof）</strong>和<strong>自动 takeover</strong>。血缘：celld 复用 LTX 格式，所以理论上 Litestream/celld 可互读 LTX 文件（v0.5.16 reader 兼容）。</p>
+
+<h2>9. 产品与成本结构视角</h2>
+<table>
+<tr><th>维度</th><th>celld 的选择</th><th>产品含义</th></tr>
+<tr><td>空闲成本</td><td>inactive cell = bucket 对象，近零</td><td>「大量用户/agent 挂着但不活跃」不再是成本灾难——按事件付费思维</td></tr>
+<tr><td>扩容</td><td>加一台机器、起一个 node、共享 bucket</td><td>无 join 服务、无账号服务；但也不 rebalance 现有 cell</td></tr>
+<tr><td>多租户</td><td>一 fleet = 一应用；无多租户调度</td><td>alpha 边界清晰：先解决单租户跑通，多租户留给产品层</td></tr>
+<tr><td>TLS/网络</td><td>不终结 TLS，peer 明文+HMAC，需私有网络</td><td>安全模型简单但依赖部署纪律</td></tr>
+</table>
+<p>对 kejun 的产品启发（RISE 模型语境）：celld 展示了「<strong>把控制面压进一个你本来就拥有的存储</strong>」的产品化路径——用户不需要学一套新 API，只需要一个 bucket + 一个二进制。对 AI Agent 场景：每个 agent 一个 cell（记忆+调度+收件箱在私有 SQLite）正是 OBCloud/DBaaS 可以考虑的「按 agent 计费」运行时模型。</p>
+
+<h2>10. 主教材推荐</h2>
+<ul>
+  <li><a href="https://github.com/denoland/celld/blob/main/README.md" target="_blank" rel="noopener">README.md（334 行）</a> —— 先读</li>
+  <li><a href="https://github.com/denoland/celld/blob/main/docs/guarantees.md" target="_blank" rel="noopener">docs/guarantees.md（228 行）</a> —— 协议论证全文，本课依据</li>
+  <li><a href="https://github.com/denoland/celld/blob/main/crates/ltx/README.md" target="_blank" rel="noopener">crates/ltx/README.md</a> —— LTX 血缘</li>
+  <li>周边：<a href="https://github.com/benbjohnson/litestream" target="_blank" rel="noopener">Litestream</a> · <a href="https://github.com/superfly/ltx" target="_blank" rel="noopener">superfly/ltx</a> · <a href="https://github.com/mikenomitch/rustyriver" target="_blank" rel="noopener">rustyriver</a></li>
+</ul>
+
+<h2>11. 下课动作 + 下一步方向</h2>
+<p><strong>今天先做一件事</strong>：本地 30 秒跑起来，看 cell 状态机。</p>
+<pre><code>curl -fsSL https://celld.dev/install.sh | sh
+celld dev</code></pre>
+<p>（或 <code>docker run --rm ghcr.io/denoland/celld --version</code>；<code>celld dev</code> 不需要 Docker/云桶，自动起 local object store，Worker 听 <code>http://127.0.0.1:9876</code>。）</p>
+<p>然后选下一步方向（回复 A / B / C / D）：</p>
+<ul>
+  <li><strong>A. 跑起来 + 拉代码读</strong>：写一个带 Durable Object + SQLite 的小 Worker，<code>celld deploy</code> 到本地 bucket，观察 cell 从 inactive → resident → idle 的状态迁移。</li>
+  <li><strong>B. 源码深潜（node_log / ltx_repl）</strong>：进 <code>crates/celld/node_log.rs</code>（212K）与 <code>ltx_repl.rs</code>（143K），把「fleet proof 确认 + takeover 封 session」在代码行数上钉死。</li>
+  <li><strong>C. 单写者复制家族横向对比</strong>：celld ↔ Litestream ↔ Turso/libSQL ↔ rqlite 的「无共识/弱共识」设计谱系，提炼可迁移手法。</li>
+  <li><strong>D. 部署到真实 bucket</strong>：R2/MinIO + 2 节点，跑 storage test 与 kill-test，验证 guarantees 承诺。</li>
+</ul>
+
+<h2>12. 自测 Quiz（想清楚再点）</h2>
+<div class="quiz">
+  <h3>Quiz</h3>
+  <p class="q">1. 两个节点能同时拥有同一 cell 吗？</p>
+  <button onclick="q1('a')">能，靠节点心跳检测</button>
+  <button onclick="q1('b')">不能，条件写只赢一个</button>
+  <button onclick="q1('c')">能，若是同一 fleet</button>
+  <div class="fb" id="fb1"></div>
+
+  <p class="q">2. 单节点的写延迟为何高？</p>
+  <button onclick="q2('a')">因为要写好几个副本</button>
+  <button onclick="q2('b')">因为每次写都等选主</button>
+  <button onclick="q2('c')">因为每次写等 bucket 往返</button>
+  <div class="fb" id="fb2"></div>
+
+  <p class="q">3. 旧主迟到的写会怎样？</p>
+  <button onclick="q3('a')">写进过期前缀不可见</button>
+  <button onclick="q3('b')">会被立刻拒绝丢弃</button>
+  <button onclick="q3('c')">覆盖新主刚写数据</button>
+  <div class="fb" id="fb3"></div>
+</div>
+
+<div class="footer">
+  celld-teach · Lesson 1 · 素材截至 2026-08-29（main @ 2026-08-28 push）· 有问题随时追问你的老师（Hermes）。
+</div>
+
+<script>
+function fb(id, text, ok) {
+  var el = document.getElementById(id);
+  el.textContent = text;
+  el.className = 'fb ' + (ok ? 'correct' : 'wrong');
+}
+function q1(ans) {
+  if (ans === 'b') fb('fb1', '✓ 正确：条件写只接受一个赢家。', true);
+  else fb('fb1', '✗ 不对：对象存储的条件写仲裁了所有权。', false);
+}
+function q2(ans) {
+  if (ans === 'c') fb('fb2', '✓ 正确：单节点无 follower，每次写等 bucket 上行。', true);
+  else fb('fb2', '✗ 不对：单节点写延迟来自存储往返。', false);
+}
+function q3(ans) {
+  if (ans === 'a') fb('fb3', '✓ 正确：epoch 前缀让旧主写落进 superseded prefix。', true);
+  else fb('fb3', '✗ 不对：fencing 靠前缀隔离，不是靠拒绝。', false);
+}
+</script>
+
+</body>
+</html>
